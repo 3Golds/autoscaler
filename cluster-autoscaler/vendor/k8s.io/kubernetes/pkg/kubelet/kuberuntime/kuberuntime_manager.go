@@ -141,6 +141,12 @@ type kubeGenericRuntimeManager struct {
 
 	// PodState provider instance
 	podStateProvider podStateProvider
+
+	// Use RuntimeDefault as the default seccomp profile for all workloads.
+	seccompDefault bool
+
+	// MemorySwapBehavior defines how swap is used
+	memorySwapBehavior string
 }
 
 // KubeGenericRuntime is a interface contains interfaces for container runtime and command.
@@ -152,7 +158,7 @@ type KubeGenericRuntime interface {
 
 // LegacyLogProvider gives the ability to use unsupported docker log drivers (e.g. journald)
 type LegacyLogProvider interface {
-	// Get the last few lines of the logs for a specific container.
+	// GetContainerLogTail gets the last few lines of the logs for a specific container.
 	GetContainerLogTail(uid kubetypes.UID, name, namespace string, containerID kubecontainer.ContainerID) (string, error)
 }
 
@@ -182,6 +188,8 @@ func NewKubeGenericRuntimeManager(
 	legacyLogProvider LegacyLogProvider,
 	logManager logs.ContainerLogManager,
 	runtimeClassManager *runtimeclass.Manager,
+	seccompDefault bool,
+	memorySwapBehavior string,
 ) (KubeGenericRuntime, error) {
 	kubeRuntimeManager := &kubeGenericRuntimeManager{
 		recorder:            recorder,
@@ -201,11 +209,13 @@ func NewKubeGenericRuntimeManager(
 		logManager:          logManager,
 		runtimeClassManager: runtimeClassManager,
 		logReduction:        logreduction.NewLogReduction(identicalErrorDelay),
+		seccompDefault:      seccompDefault,
+		memorySwapBehavior:  memorySwapBehavior,
 	}
 
 	typedVersion, err := kubeRuntimeManager.getTypedVersion()
 	if err != nil {
-		klog.ErrorS(err, "Get runtime version failed: %v")
+		klog.ErrorS(err, "Get runtime version failed")
 		return nil, err
 	}
 
@@ -403,6 +413,16 @@ func (m *kubeGenericRuntimeManager) GetPods(all bool) ([]*kubecontainer.Pod, err
 	return result, nil
 }
 
+// containerKillReason explains what killed a given container
+type containerKillReason string
+
+const (
+	reasonStartupProbe        containerKillReason = "StartupProbe"
+	reasonLivenessProbe       containerKillReason = "LivenessProbe"
+	reasonFailedPostStartHook containerKillReason = "FailedPostStartHook"
+	reasonUnknown             containerKillReason = "Unknown"
+)
+
 // containerToKillInfo contains necessary information to kill a container.
 type containerToKillInfo struct {
 	// The spec of the container.
@@ -411,6 +431,9 @@ type containerToKillInfo struct {
 	name string
 	// The message indicates why the container will be killed.
 	message string
+	// The reason is a clearer source of info on why a container will be killed
+	// TODO: replace message with reason?
+	reason containerKillReason
 }
 
 // podActions keeps information what to do for a pod.
@@ -501,7 +524,7 @@ func containerSucceeded(c *v1.Container, podStatus *kubecontainer.PodStatus) boo
 
 // computePodActions checks whether the pod spec has changed and returns the changes if true.
 func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *kubecontainer.PodStatus) podActions {
-	klog.V(5).InfoS("Syncing Pod", klog.KObj(pod))
+	klog.V(5).InfoS("Syncing Pod", "pod", klog.KObj(pod))
 
 	createPodSandbox, attempt, sandboxID := m.podSandboxChanged(pod, podStatus)
 	changes := podActions{
@@ -582,6 +605,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 						container: next,
 						message: fmt.Sprintf("Init container is in %q state, try killing it before restart",
 							initLastStatus.State),
+						reason: reasonUnknown,
 					}
 				}
 				changes.NextInitContainerToStart = next
@@ -623,6 +647,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 						container: &pod.Spec.Containers[idx],
 						message: fmt.Sprintf("Container is in %q state, try killing it before restart",
 							containerStatus.State),
+						reason: reasonUnknown,
 					}
 				}
 			}
@@ -630,6 +655,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		}
 		// The container is running, but kill the container if any of the following condition is met.
 		var message string
+		var reason containerKillReason
 		restart := shouldRestartOnFailure(pod)
 		if _, _, changed := containerChanged(&container, containerStatus); changed {
 			message = fmt.Sprintf("Container %s definition changed", container.Name)
@@ -639,9 +665,11 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		} else if liveness, found := m.livenessManager.Get(containerStatus.ID); found && liveness == proberesults.Failure {
 			// If the container failed the liveness probe, we should kill it.
 			message = fmt.Sprintf("Container %s failed liveness probe", container.Name)
+			reason = reasonLivenessProbe
 		} else if startup, found := m.startupManager.Get(containerStatus.ID); found && startup == proberesults.Failure {
 			// If the container failed the startup probe, we should kill it.
 			message = fmt.Sprintf("Container %s failed startup probe", container.Name)
+			reason = reasonStartupProbe
 		} else {
 			// Keep the container.
 			keepCount++
@@ -660,6 +688,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 			name:      containerStatus.Name,
 			container: &pod.Spec.Containers[idx],
 			message:   message,
+			reason:    reason,
 		}
 		klog.V(2).InfoS("Message for Container of pod", "containerName", container.Name, "containerStatusID", containerStatus.ID, "pod", klog.KObj(pod), "containerMessage", message)
 	}
@@ -692,16 +721,16 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 		if podContainerChanges.SandboxID != "" {
 			m.recorder.Eventf(ref, v1.EventTypeNormal, events.SandboxChanged, "Pod sandbox changed, it will be killed and re-created.")
 		} else {
-			klog.V(4).InfoS("SyncPod received new pod, will create a sandbox for it", klog.KObj(pod))
+			klog.V(4).InfoS("SyncPod received new pod, will create a sandbox for it", "pod", klog.KObj(pod))
 		}
 	}
 
 	// Step 2: Kill the pod if the sandbox has changed.
 	if podContainerChanges.KillPod {
 		if podContainerChanges.CreateSandbox {
-			klog.V(4).InfoS("Stopping PodSandbox for pod, will start new one", klog.KObj(pod))
+			klog.V(4).InfoS("Stopping PodSandbox for pod, will start new one", "pod", klog.KObj(pod))
 		} else {
-			klog.V(4).InfoS("Stopping PodSandbox for pod, because all other containers are dead", klog.KObj(pod))
+			klog.V(4).InfoS("Stopping PodSandbox for pod, because all other containers are dead", "pod", klog.KObj(pod))
 		}
 
 		killResult := m.killPodWithSyncResult(pod, kubecontainer.ConvertPodStatusToRunningPod(m.runtimeName, podStatus), nil)
@@ -720,7 +749,7 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 			klog.V(3).InfoS("Killing unwanted container for pod", "containerName", containerInfo.name, "containerID", containerID, "pod", klog.KObj(pod))
 			killContainerResult := kubecontainer.NewSyncResult(kubecontainer.KillContainer, containerInfo.name)
 			result.AddSyncResult(killContainerResult)
-			if err := m.killContainer(pod, containerID, containerInfo.name, containerInfo.message, nil); err != nil {
+			if err := m.killContainer(pod, containerID, containerInfo.name, containerInfo.message, containerInfo.reason, nil); err != nil {
 				killContainerResult.Fail(kubecontainer.ErrKillContainer, err.Error())
 				klog.ErrorS(err, "killContainer for pod failed", "containerName", containerInfo.name, "containerID", containerID, "pod", klog.KObj(pod))
 				return
@@ -768,10 +797,10 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 				return
 			}
 			createSandboxResult.Fail(kubecontainer.ErrCreatePodSandbox, msg)
-			klog.ErrorS(err, "CreatePodSandbox for pod failed", klog.KObj(pod))
+			klog.ErrorS(err, "CreatePodSandbox for pod failed", "pod", klog.KObj(pod))
 			ref, referr := ref.GetReference(legacyscheme.Scheme, pod)
 			if referr != nil {
-				klog.ErrorS(referr, "Couldn't make a ref to pod %q: '%v'", klog.KObj(pod))
+				klog.ErrorS(referr, "Couldn't make a ref to pod", "pod", klog.KObj(pod))
 			}
 			m.recorder.Eventf(ref, v1.EventTypeWarning, events.FailedCreatePodSandBox, "Failed to create pod sandbox: %v", err)
 			return
@@ -832,7 +861,7 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 			return err
 		}
 
-		klog.V(4).InfoS("Creating container in pod %v", "containerType", typeName, "container", spec.container, "pod", klog.KObj(pod))
+		klog.V(4).InfoS("Creating container in pod", "containerType", typeName, "container", spec.container, "pod", klog.KObj(pod))
 		// NOTE (aramase) podIPs are populated for single stack and dual stack clusters. Send only podIPs.
 		if msg, err := m.startContainer(podSandboxID, podSandboxConfig, spec, pod, podStatus, pullSecrets, podIP, podIPs); err != nil {
 			startContainerResult.Fail(err, msg)
@@ -840,7 +869,7 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 			// repetitive log spam
 			switch {
 			case err == images.ErrImagePullBackOff:
-				klog.V(3).InfoS("Container start failed in pod", "containerType", typeName, "container", spec.container, klog.KObj(pod), "containerMessage", msg, "err", err)
+				klog.V(3).InfoS("Container start failed in pod", "containerType", typeName, "container", spec.container, "pod", klog.KObj(pod), "containerMessage", msg, "err", err)
 			default:
 				utilruntime.HandleError(fmt.Errorf("%v %+v start failed in pod %v: %v: %s", typeName, spec.container, format.Pod(pod), err, msg))
 			}

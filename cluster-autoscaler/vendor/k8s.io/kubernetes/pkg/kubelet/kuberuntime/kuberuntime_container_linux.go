@@ -30,6 +30,7 @@ import (
 	kubefeatures "k8s.io/kubernetes/pkg/features"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/qos"
+	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
 
 // applyPlatformSpecificContainerConfig applies platform specific configurations to runtimeapi.ContainerConfig.
@@ -89,6 +90,23 @@ func (m *kubeGenericRuntimeManager) generateLinuxContainerConfig(container *v1.C
 
 	lc.Resources.HugepageLimits = GetHugepageLimitsFromResources(container.Resources)
 
+	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.NodeSwapEnabled) {
+		// NOTE(ehashman): Behaviour is defined in the opencontainers runtime spec:
+		// https://github.com/opencontainers/runtime-spec/blob/1c3f411f041711bbeecf35ff7e93461ea6789220/config-linux.md#memory
+		switch m.memorySwapBehavior {
+		case kubelettypes.UnlimitedSwap:
+			// -1 = unlimited swap
+			lc.Resources.MemorySwapLimitInBytes = -1
+		case kubelettypes.LimitedSwap:
+			fallthrough
+		default:
+			// memorySwapLimit = total permitted memory+swap; if equal to memory limit, => 0 swap above memory limit
+			// Some swapping is still possible.
+			// Note that if memory limit is 0, memory swap limit is ignored.
+			lc.Resources.MemorySwapLimitInBytes = lc.Resources.MemoryLimitInBytes
+		}
+	}
+
 	return lc
 }
 
@@ -112,13 +130,13 @@ func GetHugepageLimitsFromResources(resources v1.ResourceRequirements) []*runtim
 
 		pageSize, err := v1helper.HugePageSizeFromResourceName(resourceObj)
 		if err != nil {
-			klog.Warningf("Failed to get hugepage size from resource name: %v", err)
+			klog.InfoS("Failed to get hugepage size from resource", "object", resourceObj, "err", err)
 			continue
 		}
 
 		sizeString, err := v1helper.HugePageUnitSizeFromByteSize(pageSize.Value())
 		if err != nil {
-			klog.Warningf("pageSize is invalid: %v", err)
+			klog.InfoS("Size is invalid", "object", resourceObj, "err", err)
 			continue
 		}
 		requiredHugepageLimits[sizeString] = uint64(amountObj.Value())

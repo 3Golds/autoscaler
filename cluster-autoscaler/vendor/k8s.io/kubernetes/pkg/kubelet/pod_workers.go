@@ -33,7 +33,6 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/kubelet/util/format"
 	"k8s.io/kubernetes/pkg/kubelet/util/queue"
 )
 
@@ -188,13 +187,13 @@ func (p *podWorkers) managePodLoop(podUpdates <-chan UpdatePodOptions) {
 		}
 		if err != nil {
 			// IMPORTANT: we do not log errors here, the syncPodFn is responsible for logging errors
-			klog.Errorf("Error syncing pod %s (%q), skipping: %v", update.Pod.UID, format.Pod(update.Pod), err)
+			klog.ErrorS(err, "Error syncing pod, skipping", "pod", klog.KObj(update.Pod), "podUID", update.Pod.UID)
 		}
 		p.wrapUp(update.Pod.UID, err)
 	}
 }
 
-// Apply the new setting to the specified pod.
+// UpdatePod apply the new setting to the specified pod.
 // If the options provide an OnCompleteFunc, the function is invoked if the update is accepted.
 // Update requests are ignored if a kill pod request is pending.
 func (p *podWorkers) UpdatePod(options *UpdatePodOptions) {
@@ -283,7 +282,8 @@ func (p *podWorkers) checkForUpdates(uid types.UID) {
 		p.podUpdates[uid] <- workUpdate
 		delete(p.lastUndeliveredWorkUpdate, uid)
 	} else {
-		p.isWorking[uid] = false
+		// put this line in removeWorker may cause dead lock, so keep reset it here
+		delete(p.isWorking, uid)
 	}
 }
 

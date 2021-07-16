@@ -83,6 +83,12 @@ type Manager interface {
 
 	// GetMemoryNUMANodes provides NUMA nodes that are used to allocate the container memory
 	GetMemoryNUMANodes(pod *v1.Pod, container *v1.Container) sets.Int
+
+	// GetAllocatableMemory returns the amount of allocatable memory for each NUMA node
+	GetAllocatableMemory() []state.Block
+
+	// GetMemory returns the memory allocated by a container from NUMA nodes
+	GetMemory(podUID, containerName string) []state.Block
 }
 
 type manager struct {
@@ -115,6 +121,9 @@ type manager struct {
 
 	// stateFileDirectory holds the directory where the state file for checkpoints is held.
 	stateFileDirectory string
+
+	// allocatableMemory holds the allocatable memory for each NUMA node
+	allocatableMemory []state.Block
 }
 
 var _ Manager = &manager{}
@@ -153,7 +162,7 @@ func NewManager(policyName string, machineInfo *cadvisorapi.MachineInfo, nodeAll
 
 // Start starts the memory manager under the kubelet and calls policy start
 func (m *manager) Start(activePods ActivePodsFunc, sourcesReady config.SourcesReady, podStatusProvider status.PodStatusProvider, containerRuntime runtimeService, initialContainers containermap.ContainerMap) error {
-	klog.Infof("[memorymanager] starting with %s policy", m.policy.Name())
+	klog.InfoS("Starting memorymanager", "policy", m.policy.Name())
 	m.sourcesReady = sourcesReady
 	m.activePods = activePods
 	m.podStatusProvider = podStatusProvider
@@ -162,16 +171,18 @@ func (m *manager) Start(activePods ActivePodsFunc, sourcesReady config.SourcesRe
 
 	stateImpl, err := state.NewCheckpointState(m.stateFileDirectory, memoryManagerStateFileName, m.policy.Name())
 	if err != nil {
-		klog.Errorf("[memorymanager] could not initialize checkpoint manager: %v, please drain node and remove policy state file", err)
+		klog.ErrorS(err, "Could not initialize checkpoint manager, please drain node and remove policy state file")
 		return err
 	}
 	m.state = stateImpl
 
 	err = m.policy.Start(m.state)
 	if err != nil {
-		klog.Errorf("[memorymanager] policy start error: %v", err)
+		klog.ErrorS(err, "Policy start error")
 		return err
 	}
+
+	m.allocatableMemory = m.policy.GetAllocatableMemory(m.state)
 
 	return nil
 }
@@ -182,9 +193,22 @@ func (m *manager) AddContainer(pod *v1.Pod, container *v1.Container, containerID
 	defer m.Unlock()
 
 	m.containerMap.Add(string(pod.UID), container.Name, containerID)
+
+	// Since we know that each init container always runs to completion before
+	// the next container starts, we can safely remove references to any previously
+	// started init containers. This will free up the memory from these init containers
+	// for use in other pods. If the current container happens to be an init container,
+	// we skip deletion of it until the next container is added, and this is called again.
+	for _, initContainer := range pod.Spec.InitContainers {
+		if initContainer.Name == container.Name {
+			break
+		}
+
+		m.policyRemoveContainerByRef(string(pod.UID), initContainer.Name)
+	}
 }
 
-// GetMemory provides NUMA nodes that used to allocate the container memory
+// GetMemoryNUMANodes provides NUMA nodes that used to allocate the container memory
 func (m *manager) GetMemoryNUMANodes(pod *v1.Pod, container *v1.Container) sets.Int {
 	// Get NUMA node affinity of blocks assigned to the container during Allocate()
 	numaNodes := sets.NewInt()
@@ -196,11 +220,11 @@ func (m *manager) GetMemoryNUMANodes(pod *v1.Pod, container *v1.Container) sets.
 	}
 
 	if numaNodes.Len() == 0 {
-		klog.V(5).Infof("No allocation is available for (Pod: %s, Container: %s)", pod.Name, container.Name)
+		klog.V(5).InfoS("No allocation is available", "pod", klog.KObj(pod), "containerName", container.Name)
 		return nil
 	}
 
-	klog.Infof("(Pod: %s, Container: %s) memory affinity is %v", pod.Name, container.Name, numaNodes)
+	klog.InfoS("Memory affinity", "pod", klog.KObj(pod), "containerName", container.Name, "numaNodes", numaNodes)
 	return numaNodes
 }
 
@@ -214,7 +238,7 @@ func (m *manager) Allocate(pod *v1.Pod, container *v1.Container) error {
 
 	// Call down into the policy to assign this container memory if required.
 	if err := m.policy.Allocate(m.state, pod, container); err != nil {
-		klog.Errorf("[memorymanager] Allocate error: %v", err)
+		klog.ErrorS(err, "Allocate error")
 		return err
 	}
 	return nil
@@ -228,15 +252,11 @@ func (m *manager) RemoveContainer(containerID string) error {
 	// if error appears it means container entry already does not exist under the container map
 	podUID, containerName, err := m.containerMap.GetContainerRef(containerID)
 	if err != nil {
-		klog.Warningf("[memorymanager] Failed to get container %s from container map error: %v", containerID, err)
+		klog.InfoS("Failed to get container from container map", "containerID", containerID, "err", err)
 		return nil
 	}
 
-	err = m.policyRemoveContainerByRef(podUID, containerName)
-	if err != nil {
-		klog.Errorf("[memorymanager] RemoveContainer error: %v", err)
-		return err
-	}
+	m.policyRemoveContainerByRef(podUID, containerName)
 
 	return nil
 }
@@ -296,23 +316,16 @@ func (m *manager) removeStaleState() {
 	for podUID := range assignments {
 		for containerName := range assignments[podUID] {
 			if _, ok := activeContainers[podUID][containerName]; !ok {
-				klog.Infof("[memorymanager] removeStaleState: removing (pod %s, container: %s)", podUID, containerName)
-				err := m.policyRemoveContainerByRef(podUID, containerName)
-				if err != nil {
-					klog.Errorf("[memorymanager] removeStaleState: failed to remove (pod %s, container %s), error: %v)", podUID, containerName, err)
-				}
+				klog.InfoS("RemoveStaleState removing state", "podUID", podUID, "containerName", containerName)
+				m.policyRemoveContainerByRef(podUID, containerName)
 			}
 		}
 	}
 }
 
-func (m *manager) policyRemoveContainerByRef(podUID string, containerName string) error {
-	err := m.policy.RemoveContainer(m.state, podUID, containerName)
-	if err == nil {
-		m.containerMap.RemoveByContainerRef(podUID, containerName)
-	}
-
-	return err
+func (m *manager) policyRemoveContainerByRef(podUID string, containerName string) {
+	m.policy.RemoveContainer(m.state, podUID, containerName)
+	m.containerMap.RemoveByContainerRef(podUID, containerName)
 }
 
 func getTotalMemoryTypeReserved(machineInfo *cadvisorapi.MachineInfo, reservedMemory []kubeletconfig.MemoryReservation) (map[v1.ResourceName]resource.Quantity, error) {
@@ -406,4 +419,14 @@ func getSystemReservedMemory(machineInfo *cadvisorapi.MachineInfo, nodeAllocatab
 	}
 
 	return reservedMemoryConverted, nil
+}
+
+// GetAllocatableMemory returns the amount of allocatable memory for each NUMA node
+func (m *manager) GetAllocatableMemory() []state.Block {
+	return m.allocatableMemory
+}
+
+// GetMemory returns the memory allocated by a container from NUMA nodes
+func (m *manager) GetMemory(podUID, containerName string) []state.Block {
+	return m.state.GetMemoryBlocks(podUID, containerName)
 }
